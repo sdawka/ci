@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fromPartial } from '@total-typescript/shoehorn';
 import type { Bindings } from '../../env';
@@ -103,34 +107,55 @@ describe('SandboxRunner', () => {
     expect(sandbox.destroy).toHaveBeenCalledOnce();
   });
 
-  it('keeps the sandbox alive until large log streams are consumed', async () => {
+  it('returns the tail of an oversized log with a truncation marker', async () => {
     const sandbox = fakeSandbox({ largeStdout: true });
     mocks.getSandbox.mockReturnValue(sandbox);
 
     const result = await runner().run(input);
 
-    expect(result.logs.stdout).toBeInstanceOf(ReadableStream);
-    expect(sandbox.destroy).not.toHaveBeenCalled();
-    expect(
-      await new Response(
-        result.logs.stdout as ReadableStream<Uint8Array>
-      ).text()
-    ).toBe('streamed stdout');
+    expect(result.logs).toEqual({
+      stdout:
+        '[log truncated: showing last 300000 of 500000 bytes]\nstdout end',
+      stderr: 'stderr',
+    });
+    expect(sandbox.readFileStream).not.toHaveBeenCalled();
     expect(sandbox.destroy).toHaveBeenCalledOnce();
   });
 
-  it('destroys the sandbox after both large streams finish', async () => {
-    const sandbox = fakeSandbox({ largeStdout: true, largeStderr: true });
-    mocks.getSandbox.mockReturnValue(sandbox);
+  it('bounds log reads in the shell and skips symlinked logs', async () => {
+    // A listing size describes a symlink, not its target, and the step can
+    // replace its log before exiting. Run the real read against local files.
+    const dir = mkdtempSync(join(tmpdir(), 'ci-logs-'));
+    try {
+      writeFileSync(join(dir, 'secret'), 'not a log');
+      symlinkSync(join(dir, 'secret'), join(dir, 'ci-step.out'));
+      writeFileSync(join(dir, 'ci-step.err'), `${'x'.repeat(400_000)}end`);
+      const sandbox = fakeSandbox();
+      sandbox.exec.mockImplementation((command: string) =>
+        Promise.resolve({
+          exitCode: 0,
+          stdout: command.includes('wc -c')
+            ? execFileSync(
+                'sh',
+                ['-c', command.replaceAll('/tmp/ci-step.', `${dir}/ci-step.`)],
+                { encoding: 'utf8' }
+              )
+            : '',
+        })
+      );
+      mocks.getSandbox.mockReturnValue(sandbox);
 
-    const result = await runner().run(input);
-    const stdout = result.logs.stdout as ReadableStream<Uint8Array>;
-    const stderr = result.logs.stderr as ReadableStream<Uint8Array>;
+      const result = await runner().run(input);
 
-    await new Response(stdout).text();
-    expect(sandbox.destroy).not.toHaveBeenCalled();
-    await stderr.cancel();
-    expect(sandbox.destroy).toHaveBeenCalledOnce();
+      expect(result.logs.stdout).toBe('');
+      const stderr = result.logs.stderr as string;
+      expect(stderr).toMatch(
+        /^\[log truncated: showing last 300000 of 400003 bytes\]\nx+end$/
+      );
+      expect(stderr.length).toBeLessThan(300_100);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -142,9 +167,7 @@ function fakeSandbox(options?: {
   exitCode?: number;
   hasFuse?: boolean;
   largeStdout?: boolean;
-  largeStderr?: boolean;
 }) {
-  const encoder = new TextEncoder();
   return {
     restoreBackup: vi.fn().mockResolvedValue(undefined),
     exec: vi.fn().mockImplementation((command: string) => {
@@ -153,6 +176,13 @@ function fakeSandbox(options?: {
           stdout: '',
           exitCode: options?.hasFuse === false ? 1 : 0,
         });
+      }
+      if (command.includes('wc -c')) {
+        const out = command.includes('/tmp/ci-step.out');
+        if (out && options?.largeStdout) {
+          return Promise.resolve({ stdout: '500000\nstdout end' });
+        }
+        return Promise.resolve({ stdout: out ? '6\nstdout' : '6\nstderr' });
       }
       if (command.includes('/tmp/ci-step.out')) {
         return Promise.resolve({ stdout: 'stdout tail' });
@@ -170,32 +200,7 @@ function fakeSandbox(options?: {
     createBackup: vi
       .fn()
       .mockResolvedValue({ id: 'backup-1', dir: '/workspace' }),
-    listFiles: vi.fn().mockResolvedValue({
-      files: [
-        {
-          absolutePath: '/tmp/ci-step.out',
-          size: options?.largeStdout ? 500_000 : 6,
-        },
-        {
-          absolutePath: '/tmp/ci-step.err',
-          size: options?.largeStderr ? 500_000 : 6,
-        },
-      ],
-    }),
-    readFile: vi.fn().mockImplementation((path: string) =>
-      Promise.resolve({
-        content: path.endsWith('.out') ? 'stdout' : 'stderr',
-      })
-    ),
-    readFileStream: vi.fn().mockImplementation(
-      () =>
-        new ReadableStream<Uint8Array>({
-          start(controller) {
-            controller.enqueue(encoder.encode('streamed stdout'));
-            controller.close();
-          },
-        })
-    ),
+    readFileStream: vi.fn(),
     destroy: vi.fn().mockResolvedValue(undefined),
   };
 }

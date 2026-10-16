@@ -33,7 +33,6 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
   /**
    * Copies source, runs the command, and snapshots `/workspace` after a
    * successful exit. A restored Snapshot is overlaid with the current source.
-   * Large log streams keep the Sandbox alive until they are read or cancelled.
    */
   async run(
     input: RunStepInput & { restore?: DirectoryBackup }
@@ -45,7 +44,6 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
       containerTimeouts: { portReadyTimeoutMS: PORT_READY_TIMEOUT_MS },
     });
 
-    let cleanupTransferredToStreams = false;
     try {
       // Containers without FUSE must restore through the local R2 binding and
       // unsquashfs. RPC streams those archives instead of base64-encoding them
@@ -102,66 +100,44 @@ export class SandboxRunner implements Runner<DirectoryBackup> {
         ttl: input.ttlSeconds,
         localBucket,
       });
-      const rawLogs = await readLogs(sandbox);
-      const streams = [rawLogs.stdout, rawLogs.stderr].filter(
-        (value): value is ReadableStream<Uint8Array> =>
-          typeof value !== 'string'
-      );
-      if (streams.length === 0) {
-        return { exitCode, logs: rawLogs, preview, snapshot };
-      }
-
-      let remainingStreams = streams.length;
-      const releaseStream = async () => {
-        remainingStreams -= 1;
-        if (remainingStreams === 0) {
-          await destroySandbox(sandbox);
-        }
-      };
-      cleanupTransferredToStreams = true;
-      return {
-        exitCode,
-        logs: {
-          stdout:
-            typeof rawLogs.stdout === 'string'
-              ? rawLogs.stdout
-              : withCleanup(rawLogs.stdout, releaseStream),
-          stderr:
-            typeof rawLogs.stderr === 'string'
-              ? rawLogs.stderr
-              : withCleanup(rawLogs.stderr, releaseStream),
-        },
-        preview,
-        snapshot,
-      };
+      const logs = await readLogs(sandbox);
+      return { exitCode, logs, preview, snapshot };
     } finally {
-      if (!cleanupTransferredToStreams) {
-        await destroySandbox(sandbox);
-      }
+      await destroySandbox(sandbox);
     }
   }
 }
 
 async function readLogs(sandbox: ReturnType<typeof getSandbox>) {
-  const listing = await sandbox.listFiles('/tmp');
-  const sizes = new Map(
-    listing.files.map((file) => [file.absolutePath, file.size])
-  );
   return {
-    stdout: await readLog(sandbox, STDOUT_FILE, sizes.get(STDOUT_FILE) ?? 0),
-    stderr: await readLog(sandbox, STDERR_FILE, sizes.get(STDERR_FILE) ?? 0),
+    stdout: await readLog(sandbox, STDOUT_FILE),
+    stderr: await readLog(sandbox, STDERR_FILE),
   };
 }
 
+/**
+ * Reads at most INLINE_LOG_BYTES from the end of a log, marking any truncation.
+ * The result is a step output, so it must be a bounded string: a stream is not
+ * serializable, and a listing size does not bound a symlink's target. Anything
+ * other than a regular file reads as empty.
+ */
 async function readLog(
   sandbox: ReturnType<typeof getSandbox>,
-  file: string,
-  size: number
-): Promise<string | ReadableStream<Uint8Array>> {
-  if (size > INLINE_LOG_BYTES) {
-    return sandbox.readFileStream(file);
+  file: string
+): Promise<string> {
+  const { stdout } = await sandbox.exec(
+    `[ -f ${file} ] && [ ! -L ${file} ] || exit 0; wc -c < ${file}; tail -c ${INLINE_LOG_BYTES} ${file}`,
+    { cwd: '/', timeout: 30_000 }
+  );
+  const newline = stdout.indexOf('\n');
+  if (newline < 0) {
+    return '';
   }
-  return (await sandbox.readFile(file, { encoding: 'utf-8' })).content;
+  const size = Number(stdout.slice(0, newline).trim());
+  const content = stdout.slice(newline + 1);
+  return size > INLINE_LOG_BYTES
+    ? `[log truncated: showing last ${INLINE_LOG_BYTES} of ${size} bytes]\n${content}`
+    : content;
 }
 
 async function readPreviews(sandbox: ReturnType<typeof getSandbox>) {
@@ -196,43 +172,6 @@ function resolveCwd(cwd: string | undefined) {
     throw new Error(`cwd must be inside ${WORKSPACE_DIR}: ${cwd}`);
   }
   return posix.join(WORKSPACE_DIR, normalized);
-}
-
-function withCleanup(
-  stream: ReadableStream<Uint8Array>,
-  release: () => Promise<void>
-) {
-  const reader = stream.getReader();
-  let released = false;
-  const releaseOnce = async () => {
-    if (!released) {
-      released = true;
-      await release();
-    }
-  };
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const result = await reader.read();
-        if (result.done) {
-          controller.close();
-          await releaseOnce();
-        } else {
-          controller.enqueue(result.value);
-        }
-      } catch (error) {
-        controller.error(error);
-        await releaseOnce();
-      }
-    },
-    async cancel(reason) {
-      try {
-        await reader.cancel(reason);
-      } finally {
-        await releaseOnce();
-      }
-    },
-  });
 }
 
 function createRunnerId(label: string) {
